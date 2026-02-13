@@ -29,6 +29,9 @@ import {
   loadConfig,
   loadManifest,
   migrateLegacyManifest,
+  listPacks,
+  loadState,
+  saveState,
   resolveCategory,
   pickSound,
   resolveActivePack,
@@ -312,6 +315,86 @@ describe("resolveActivePack", () => {
     setupListPacks(["peon"])
     const config = { ...DEFAULT_CONFIG, active_pack: "peon", pack_rotation: ["gone1", "gone2"] }
     expect(resolveActivePack(config, makeState(), "s1", "/p")).toBe("peon")
+  })
+})
+
+// ---------------------------------------------------------------------------
+// listPacks
+// ---------------------------------------------------------------------------
+
+describe("listPacks", () => {
+  beforeEach(() => vi.resetAllMocks())
+
+  it("returns sorted pack names that have a manifest file", () => {
+    vi.mocked(fs.readdirSync).mockReturnValue(["glados", "peon", "peasant"] as any)
+    vi.mocked(fs.statSync).mockReturnValue({ isDirectory: () => true } as any)
+    vi.mocked(fs.existsSync).mockReturnValue(true)
+    expect(listPacks("/packs")).toEqual(["glados", "peasant", "peon"])
+  })
+
+  it("excludes entries that are not directories", () => {
+    vi.mocked(fs.readdirSync).mockReturnValue(["peon", "readme.txt"] as any)
+    vi.mocked(fs.statSync).mockImplementation((p) => ({
+      isDirectory: () => !String(p).includes("readme"),
+    }) as any)
+    vi.mocked(fs.existsSync).mockReturnValue(true)
+    expect(listPacks("/packs")).toEqual(["peon"])
+  })
+
+  it("excludes directories without openpeon.json or manifest.json", () => {
+    vi.mocked(fs.readdirSync).mockReturnValue(["empty-dir"] as any)
+    vi.mocked(fs.statSync).mockReturnValue({ isDirectory: () => true } as any)
+    vi.mocked(fs.existsSync).mockReturnValue(false)
+    expect(listPacks("/packs")).toEqual([])
+  })
+
+  it("returns empty array when packs dir does not exist", () => {
+    vi.mocked(fs.readdirSync).mockImplementation(() => { throw new Error("ENOENT") })
+    expect(listPacks("/nonexistent")).toEqual([])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// loadState / saveState
+// ---------------------------------------------------------------------------
+
+describe("loadState", () => {
+  beforeEach(() => vi.resetAllMocks())
+
+  it("returns default empty state when file is missing", () => {
+    vi.mocked(fs.readFileSync).mockImplementation(() => { throw new Error("ENOENT") })
+    expect(loadState()).toEqual({ last_played: {}, session_packs: {} })
+  })
+
+  it("parses persisted state from disk", () => {
+    const persisted: PeonState = {
+      last_played: { "task.complete": "sounds/done.wav" },
+      session_packs: { "oc-123": "glados" },
+    }
+    vi.mocked(fs.readFileSync).mockReturnValue(JSON.stringify(persisted))
+    expect(loadState()).toEqual(persisted)
+  })
+})
+
+describe("saveState", () => {
+  beforeEach(() => vi.resetAllMocks())
+
+  it("writes state as pretty-printed JSON and creates directory", () => {
+    const state: PeonState = {
+      last_played: { "session.start": "sounds/hi.wav" },
+      session_packs: {},
+    }
+    saveState(state)
+    expect(fs.mkdirSync).toHaveBeenCalledWith(expect.any(String), { recursive: true })
+    expect(fs.writeFileSync).toHaveBeenCalledWith(
+      expect.any(String),
+      JSON.stringify(state, null, 2),
+    )
+  })
+
+  it("does not throw when write fails", () => {
+    vi.mocked(fs.mkdirSync).mockImplementation(() => { throw new Error("EPERM") })
+    expect(() => saveState({ last_played: {}, session_packs: {} })).not.toThrow()
   })
 })
 
