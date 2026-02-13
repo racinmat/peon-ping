@@ -162,19 +162,18 @@ play_sound() {
       save_sound_pid $!
       ;;
     wsl)
-      local wpath
-      wpath=$(wslpath -w "$file")
-      # Convert backslashes to forward slashes for file:/// URI
-      wpath="${wpath//\\//}"
+      local tmpdir tmpfile
+      tmpdir=$(powershell.exe -NoProfile -NonInteractive -Command '[System.IO.Path]::GetTempPath()' 2>/dev/null | tr -d '\r')
+      tmpfile="$(wslpath -u "${tmpdir}peon-ping-sound.wav")"
+      if command -v ffmpeg &>/dev/null; then
+        ffmpeg -y -i "$file" -filter:a "volume=$vol" "$tmpfile" 2>/dev/null
+      elif [[ "$file" == *.wav ]]; then
+        cp "$file" "$tmpfile"
+      else
+        return 0
+      fi
       powershell.exe -NoProfile -NonInteractive -Command "
-        Add-Type -AssemblyName PresentationCore
-        \$p = New-Object System.Windows.Media.MediaPlayer
-        \$p.Open([Uri]::new('file:///$wpath'))
-        \$p.Volume = $vol
-        Start-Sleep -Milliseconds 200
-        \$p.Play()
-        Start-Sleep -Seconds 3
-        \$p.Close()
+        (New-Object Media.SoundPlayer '${tmpdir}peon-ping-sound.wav').PlaySync()
       " &>/dev/null &
       save_sound_pid $!
       ;;
@@ -218,11 +217,12 @@ send_notification() {
       case "${TERM_PROGRAM:-}" in
         iTerm.app)
           # iTerm2 OSC 9 — notification with iTerm2 icon
-          printf '\e]9;%s\007' "$title: $msg" 2>/dev/null
+          # Write to /dev/tty to bypass Claude Code stdout capture
+          printf '\e]9;%s\007' "$title: $msg" > /dev/tty 2>/dev/null || true
           ;;
         kitty)
           # Kitty OSC 99
-          printf '\e]99;i=peon:d=0;%s\e\\' "$title: $msg" 2>/dev/null
+          printf '\e]99;i=peon:d=0;%s\e\\' "$title: $msg" > /dev/tty 2>/dev/null || true
           ;;
         *)
           if command -v terminal-notifier &>/dev/null && [ -f "$icon_path" ]; then
@@ -332,7 +332,7 @@ APPLESCRIPT
         if [ -f "$icon_path" ]; then
           icon_flag="--icon=$icon_path"
         fi
-        nohup notify-send --urgency="$urgency" $icon_flag "$title" "$msg" >/dev/null 2>&1 &
+        nohup notify-send --urgency="$urgency" --expire-time=5000 $icon_flag "$title" "$msg" >/dev/null 2>&1 &
       fi
       ;;
   esac
@@ -904,6 +904,139 @@ print('service=' + mn.get('service', ''))
     shift
     exec bash "$RELAY_SCRIPT" "$@"
     ;;
+  preview)
+    PREVIEW_CAT="${2:-session.start}"
+    # --list: show all categories and sound counts in the active pack
+    if [ "$PREVIEW_CAT" = "--list" ]; then
+      python3 -c "
+import json, os, sys
+
+peon_dir = '$PEON_DIR'
+config_path = '$CONFIG'
+
+try:
+    cfg = json.load(open(config_path))
+except:
+    cfg = {}
+active_pack = cfg.get('active_pack', 'peon')
+
+pack_dir = os.path.join(peon_dir, 'packs', active_pack)
+if not os.path.isdir(pack_dir):
+    print('peon-ping: pack \"' + active_pack + '\" not found.', file=sys.stderr)
+    sys.exit(1)
+manifest = None
+for mname in ('openpeon.json', 'manifest.json'):
+    mpath = os.path.join(pack_dir, mname)
+    if os.path.exists(mpath):
+        manifest = json.load(open(mpath))
+        break
+if not manifest:
+    print('peon-ping: no manifest found for pack \"' + active_pack + '\".', file=sys.stderr)
+    sys.exit(1)
+
+display_name = manifest.get('display_name', active_pack)
+categories = manifest.get('categories', {})
+print('peon-ping: categories in ' + display_name)
+print()
+for cat in sorted(categories):
+    sounds = categories[cat].get('sounds', [])
+    count = len(sounds)
+    unit = 'sound' if count == 1 else 'sounds'
+    print(f'  {cat:24s} {count} {unit}')
+"
+      exit $? ;
+    fi
+    # Use Python to load config, find manifest, and list sounds for the category
+    PREVIEW_OUTPUT=$(python3 -c "
+import json, os, sys
+
+peon_dir = '$PEON_DIR'
+config_path = '$CONFIG'
+
+# Load config
+try:
+    cfg = json.load(open(config_path))
+except:
+    cfg = {}
+volume = cfg.get('volume', 0.5)
+active_pack = cfg.get('active_pack', 'peon')
+
+# Load manifest
+pack_dir = os.path.join(peon_dir, 'packs', active_pack)
+if not os.path.isdir(pack_dir):
+    print('ERROR:Pack \"' + active_pack + '\" not found.', file=sys.stderr)
+    sys.exit(1)
+manifest = None
+for mname in ('openpeon.json', 'manifest.json'):
+    mpath = os.path.join(pack_dir, mname)
+    if os.path.exists(mpath):
+        manifest = json.load(open(mpath))
+        break
+if not manifest:
+    print('ERROR:No manifest found for pack \"' + active_pack + '\".', file=sys.stderr)
+    sys.exit(1)
+
+category = '$PREVIEW_CAT'
+categories = manifest.get('categories', {})
+cat_data = categories.get(category)
+if not cat_data or not cat_data.get('sounds'):
+    avail = ', '.join(sorted(c for c in categories if categories[c].get('sounds')))
+    print('ERROR:Category \"' + category + '\" not found in pack \"' + active_pack + '\".', file=sys.stderr)
+    print('Available categories: ' + avail, file=sys.stderr)
+    sys.exit(1)
+
+display_name = manifest.get('display_name', active_pack)
+print('PACK_DISPLAY=' + repr(display_name))
+print('VOLUME=' + str(volume))
+
+sounds = cat_data['sounds']
+for i, s in enumerate(sounds):
+    file_ref = s.get('file', '')
+    label = s.get('label', file_ref)
+    if '/' in file_ref:
+        fpath = os.path.realpath(os.path.join(pack_dir, file_ref))
+    else:
+        fpath = os.path.realpath(os.path.join(pack_dir, 'sounds', file_ref))
+    pack_root = os.path.realpath(pack_dir) + os.sep
+    if not fpath.startswith(pack_root):
+        continue
+    print('SOUND:' + fpath + '|' + label)
+" 2>"$PEON_DIR/.preview_err")
+    PREVIEW_RC=$?
+    if [ $PREVIEW_RC -ne 0 ]; then
+      cat "$PEON_DIR/.preview_err" | sed 's/^ERROR:/peon-ping: /' >&2
+      rm -f "$PEON_DIR/.preview_err"
+      exit 1
+    fi
+    rm -f "$PEON_DIR/.preview_err"
+
+    # Parse output
+    PREVIEW_VOL=$(echo "$PREVIEW_OUTPUT" | grep '^VOLUME=' | head -1 | cut -d= -f2)
+    PREVIEW_VOL="${PREVIEW_VOL:-0.5}"
+    PACK_DISPLAY=$(echo "$PREVIEW_OUTPUT" | grep '^PACK_DISPLAY=' | head -1 | sed "s/^PACK_DISPLAY=//;s/^'//;s/'$//")
+
+    echo "peon-ping: previewing [$PREVIEW_CAT] from $PACK_DISPLAY"
+    echo ""
+
+    echo "$PREVIEW_OUTPUT" | grep '^SOUND:' | while IFS='|' read -r filepath label; do
+      filepath="${filepath#SOUND:}"
+      if [ -f "$filepath" ]; then
+        echo "  ▶ $label"
+        play_sound "$filepath" "$PREVIEW_VOL"
+        wait
+        sleep 0.3
+      fi
+    done
+    exit 0 ;;
+  update)
+    echo "Updating peon-ping..."
+    INSTALL_SCRIPT="$PEON_DIR/install.sh"
+    if [ -f "$INSTALL_SCRIPT" ]; then
+      bash "$INSTALL_SCRIPT"
+    else
+      curl -fsSL https://raw.githubusercontent.com/PeonPing/peon-ping/main/install.sh | bash
+    fi
+    exit $? ;;
   help|--help|-h)
     cat <<'HELPEOF'
 Usage: peon <command>
@@ -915,6 +1048,11 @@ Commands:
   status               Check if paused or active
   notifications on     Enable desktop notifications
   notifications off    Disable desktop notifications
+  preview [category]   Play all sounds from a category (default: session.start)
+  preview --list       List all categories and sound counts in the active pack
+                       Categories: session.start, task.acknowledge, task.complete,
+                       task.error, input.required, resource.limit, user.spam
+  update               Update peon-ping and refresh all sound packs
   help                 Show this help
 
 Pack management:
@@ -987,6 +1125,8 @@ if str(cfg.get('enabled', True)).lower() == 'false':
 
 volume = cfg.get('volume', 0.5)
 desktop_notif = cfg.get('desktop_notifications', True)
+tab_color_cfg = cfg.get('tab_color', {})
+tab_color_enabled = str(tab_color_cfg.get('enabled', True)).lower() != 'false'
 active_pack = cfg.get('active_pack', 'peon')
 pack_rotation = cfg.get('pack_rotation', [])
 annoyed_threshold = int(cfg.get('annoyed_threshold', 3))
@@ -1209,6 +1349,24 @@ if state_dirty:
     os.makedirs(os.path.dirname(state_file) or '.', exist_ok=True)
     json.dump(state, open(state_file, 'w'))
 
+# --- iTerm2 tab color mapping ---
+# Configurable via config.json: tab_color.enabled (default true),
+# tab_color.colors.{ready,working,done,needs_approval} as [r,g,b] arrays.
+tab_color_rgb = ''
+if tab_color_enabled:
+    default_colors = {
+        'ready':          [65, 115, 80],   # muted green
+        'working':        [130, 105, 50],  # muted amber
+        'done':           [65, 100, 140],  # muted blue
+        'needs_approval': [150, 70, 70],   # muted red
+    }
+    custom = tab_color_cfg.get('colors', {})
+    colors = {k: custom.get(k, v) for k, v in default_colors.items()}
+    status_key = status.replace(' ', '_') if status else ''
+    if status_key in colors:
+        rgb = colors[status_key]
+        tab_color_rgb = f'{rgb[0]} {rgb[1]} {rgb[2]}'
+
 # --- Output shell variables ---
 print('PEON_EXIT=false')
 print('EVENT=' + q(event))
@@ -1224,6 +1382,7 @@ mn = cfg.get('mobile_notify', {})
 mobile_on = bool(mn and mn.get('service') and mn.get('enabled', True))
 print('MOBILE_NOTIF=' + ('true' if mobile_on else 'false'))
 print('SOUND_FILE=' + q(sound_file))
+print('TAB_COLOR_RGB=' + q(tab_color_rgb))
 " <<< "$INPUT" 2>/dev/null)"
 
 # If Python signalled early exit (disabled, agent, unknown event), bail out
@@ -1294,8 +1453,19 @@ fi
 TITLE="${MARKER}${PROJECT}: ${STATUS}"
 
 # --- Set tab title via ANSI escape (works in Warp, iTerm2, Terminal.app, etc.) ---
+# Write to /dev/tty so the escape sequence reaches the terminal directly.
+# Claude Code captures hook stdout, so plain printf would be swallowed.
 if [ -n "$TITLE" ]; then
-  printf '\033]0;%s\007' "$TITLE"
+  printf '\033]0;%s\007' "$TITLE" > /dev/tty 2>/dev/null || true
+fi
+
+# --- Set iTerm2 tab color (OSC 6) ---
+# Uses /dev/tty for the same reason as tab title above.
+if [ -n "$TAB_COLOR_RGB" ] && [[ "${TERM_PROGRAM:-}" == "iTerm.app" ]]; then
+  read -r _R _G _B <<< "$TAB_COLOR_RGB"
+  printf "\033]6;1;bg;red;brightness;%d\a" "$_R" > /dev/tty 2>/dev/null || true
+  printf "\033]6;1;bg;green;brightness;%d\a" "$_G" > /dev/tty 2>/dev/null || true
+  printf "\033]6;1;bg;blue;brightness;%d\a" "$_B" > /dev/tty 2>/dev/null || true
 fi
 
 # --- Play sound ---
@@ -1315,5 +1485,4 @@ if [ -n "$NOTIFY" ] && [ "$PAUSED" != "true" ] && [ "${MOBILE_NOTIF:-false}" = "
   send_mobile_notification "$MSG" "$TITLE" "${NOTIFY_COLOR:-red}"
 fi
 
-wait
 exit 0
